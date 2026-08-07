@@ -27,6 +27,13 @@ contract MockUSDC {
         balanceOf[to] += amount;
         return true;
     }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
 }
 
 /// @dev Mimics Jackpot.getDrawingState()/.currentDrawingId() closely enough

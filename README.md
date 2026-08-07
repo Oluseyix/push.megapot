@@ -152,11 +152,26 @@ Confirmed and fixed in this pass:
   per-recipient check the starter kit's own UI does is
   `getBatchOrderInfo(recipient).batchOrder.remainingTickets > 0` - that's
   what Push checks now instead.
+- Bankroll backer yield distribution is implemented: `fundBankroll()` now
+  mints shares proportional to the pool a deposit buys into (first
+  depositor 1:1), and `withdrawBankroll(shares)` redeems them for a
+  proportional slice of the live (unreserved) `bankroll`. Yield is
+  organic, not leveraged - the house edge means crashed reservations
+  return to `bankroll` in full while survived payouts return less, so
+  existing shares appreciate purely from players busting, never from
+  anything scaling beyond what the bankroll already has. `backerShareValue(address)`
+  gives a read-only preview of what a backer's shares are currently worth.
+  Deliberately simple: no protection against the classic empty-vault-
+  after-a-loss edge case (see `fundBankroll()`'s doc comment) - acceptable
+  at hackathon scale, worth hardening (e.g. Uniswap V2-style minimum
+  locked shares) before real backer volume. Not surfaced in the frontend
+  yet - that wasn't in the priority screen list, and the original "don't
+  let backers think they're earning yield if you surface it in UI" concern
+  no longer applies now that yield is actually tracked.
 
-Still open, not verified against a live network:
-
-- Yield distribution to bankroll backers is not implemented -
-  `fundBankroll()` accepts deposits but doesn't track or pay out shares yet.
+Still open, not verified against a live network: none of the four
+originally-listed gaps remain - see "Next steps" below for what's still
+genuinely open (mostly live-network verification, not missing mechanisms).
 
 ## Mapping to Megapot's judging bullets
 
@@ -264,7 +279,11 @@ whether the bankroll is profitable over volume.
    read.~~ Done - also surfaced and fixed a bigger problem along the way:
    `JackpotRandomTicketBuyer` doesn't exist (see "What's verified vs. still
    open"). Every purchase now routes through `BatchPurchaseFacilitator`.
-4. Design and implement bankroll backer shares/yield.
+4. ~~Design and implement bankroll backer shares/yield.~~ Done -
+   `fundBankroll`/`withdrawBankroll` now mint/burn shares against the live
+   bankroll. Still to do: a frontend surface for it (deliberately out of
+   scope for the priority screen list), and hardening against the
+   empty-vault-after-a-loss edge case before real volume.
 5. ~~Write Foundry tests against Inco's `IncoTest` base contract before
    touching testnet.~~ Done - see "Test suite" below.
 
@@ -336,7 +355,7 @@ concern for a value that scales with player stake. Fixed with an explicit
 coverage - see "Next steps" above for the `IncoTest` base-contract pattern
 to write them against.
 
-## Test suite - 11/11 passing, against the real Inco harness
+## Test suite - 15/15 passing, against the real Inco harness
 
 `foundry/test/Push.t.sol` tests Push against Inco's own real `IncoTest` base
 contract (full fake infra: Safe multisig deploy, TEE bootstrap simulation,
@@ -355,10 +374,13 @@ rejection when the caller doesn't top up Push's Inco ETH fee reserve,
 correct reserve/release accounting on both survive and crash outcomes,
 player stats and streak tracking, double-settlement protection, cashout
 access control, routing every purchase through the batch facilitator,
-rejecting a settlement while the same recipient has a pending order, and the
+rejecting a settlement while the same recipient has a pending order, the
 community pool paying out exactly what it accumulated - including the
 small-pot case that correctly buys zero tickets rather than reverting or
-over-promising.
+over-promising - and bankroll backer shares: 1:1 first-deposit minting,
+share value appreciating from a crashed stake without minting new shares,
+a later backer receiving fewer shares per dollar at the appreciated price,
+and proportional USDC returned (with shares burned) on withdrawal.
 
 ### Two real findings from writing these tests (not just "tests added")
 

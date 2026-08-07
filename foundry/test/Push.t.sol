@@ -396,4 +396,89 @@ contract PushTest is IncoTest {
         assertEq(spent, 0, "a sub-$1 pot should buy nothing, not revert and not over-promise");
     }
 
+    // ============================================================
+    // Bankroll backer shares - yield distribution
+    // ============================================================
+
+    function testFundBankrollMintsSharesOneToOneFirstTime() public {
+        usdc.approve(address(push), 100 * TICKET_PRICE);
+        uint256 shares = push.fundBankroll(100 * TICKET_PRICE);
+
+        assertEq(shares, 100 * TICKET_PRICE, "first depositor mints 1:1");
+        assertEq(push.backerShares(address(this)), 100 * TICKET_PRICE);
+        assertEq(push.totalShares(), 100 * TICKET_PRICE);
+        assertEq(push.bankroll(), 100 * TICKET_PRICE);
+    }
+
+    function testBackerShareValueGrowsFromCrashedStakesWithoutMintingNewShares() public {
+        _fundBankroll(1000); // address(this) is the sole backer
+        uint256 sharesBefore = push.backerShares(address(this));
+        assertEq(push.backerShareValue(address(this)), 1000 * TICKET_PRICE, "share value starts equal to deposit");
+
+        // Alice stakes $10 and claims the top tier index (6) - this busts
+        // deterministically: surviving requires claimedTierIndex <
+        // crashTierIndex, and crashTierIndex is drawn in [0,7), so claiming
+        // the maximum valid index (6) can never be less than the draw.
+        // Not a "first draw" coincidence like other tests in this file -
+        // a mathematical guarantee independent of the confidential draw.
+        vm.startPrank(alice);
+        usdc.approve(address(push), 10 * TICKET_PRICE);
+        uint256 roundId = push.stake{value: incoFee}(10);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        push.requestCashOut{value: incoFee}(roundId, 6);
+        processAllOperations();
+
+        bytes32 survivedHandle = push.pendingSurvivedHandle(roundId);
+        (DecryptionAttestation memory attestation, bytes[] memory signatures) =
+            getDecryptionAttestation(alice, HandleWithProof({handle: survivedHandle, proof: _emptyAllowanceProof()}));
+        push.settleCashOut(roundId, attestation, signatures);
+
+        // The backer's share count is unchanged, but each share is now
+        // worth more - alice's crashed stake (net of the 2% community
+        // skim) now backs the existing shares instead of minting new ones.
+        // This is backers' yield: it comes entirely from players busting,
+        // never from anything leveraged.
+        assertEq(push.backerShares(address(this)), sharesBefore, "no new shares minted for the backer");
+        uint256 skim = (10 * TICKET_PRICE * push.COMMUNITY_SKIM_BPS()) / 10_000;
+        uint256 expectedGrowth = 10 * TICKET_PRICE - skim;
+        assertEq(
+            push.backerShareValue(address(this)),
+            1000 * TICKET_PRICE + expectedGrowth,
+            "share value should grow by alice's lost stake net of the community skim"
+        );
+
+        // A second backer funding now, at the appreciated share price,
+        // should receive fewer shares per dollar than the first backer did.
+        usdc.mint(bob, 1_000 * TICKET_PRICE);
+        vm.startPrank(bob);
+        usdc.approve(address(push), 100 * TICKET_PRICE);
+        uint256 bobShares = push.fundBankroll(100 * TICKET_PRICE);
+        vm.stopPrank();
+        assertLt(bobShares, 100 * TICKET_PRICE, "later backer should get fewer shares per dollar than the pool's growth");
+    }
+
+    function testWithdrawBankrollReturnsProportionalUsdcAndBurnsShares() public {
+        _fundBankroll(500);
+        uint256 usdcBefore = usdc.balanceOf(address(this));
+        uint256 shares = push.backerShares(address(this));
+
+        uint256 amountOut = push.withdrawBankroll(shares);
+
+        assertEq(amountOut, 500 * TICKET_PRICE, "sole backer withdrawing all shares gets the whole bankroll back");
+        assertEq(push.backerShares(address(this)), 0);
+        assertEq(push.totalShares(), 0);
+        assertEq(push.bankroll(), 0);
+        assertEq(usdc.balanceOf(address(this)), usdcBefore + amountOut);
+    }
+
+    function testWithdrawBankrollRevertsWhenSharesExceedBalance() public {
+        _fundBankroll(50);
+        uint256 shares = push.backerShares(address(this));
+
+        vm.expectRevert(bytes("insufficient shares"));
+        push.withdrawBankroll(shares + 1);
+    }
+
 }

@@ -89,6 +89,7 @@ interface IJackpot {
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
 }
 
@@ -139,13 +140,27 @@ contract Push {
     uint256 public nextRoundId;
     uint256 public bankroll;
 
+    // ---------- Bankroll backer shares ----------
+    // ERC4626-vault-lite: shares mint proportional to the bankroll they buy
+    // into, so as the house edge grows `bankroll` over time (crashed
+    // reservations return in full; survived payouts return only
+    // `reserved - cost`, always less), each outstanding share's redeemable
+    // value grows with it - that's backers' yield. Deliberately simple for
+    // now: no protection against the classic empty-vault-after-a-loss edge
+    // case (see fundBankroll()'s doc comment) - fine for a hackathon-scale
+    // deployment, worth hardening (e.g. Uniswap V2-style minimum locked
+    // shares) before real backer volume.
+    mapping(address => uint256) public backerShares;
+    uint256 public totalShares;
+
     mapping(uint256 => bytes32) public pendingSurvivedHandle;
     mapping(uint256 => uint8) public pendingClaimedTier;
 
     event RoundStarted(uint256 indexed roundId, address indexed player, uint256 stakedDollars);
     event CashOutRequested(uint256 indexed roundId, uint8 claimedTierIndex, bytes32 survivedHandle);
     event Settled(uint256 indexed roundId, bool survived, uint256 ticketsWon);
-    event BankrollFunded(address indexed backer, uint256 amount);
+    event BankrollFunded(address indexed backer, uint256 amount, uint256 sharesMinted);
+    event BankrollWithdrawn(address indexed backer, uint256 shares, uint256 amountOut);
     event BatchOrderPending(address indexed recipient, uint256 count);
     event EthFeeReserveToppedUp(address indexed from, uint256 amount);
 
@@ -371,10 +386,54 @@ contract Push {
         emit Settled(roundId, survived, ticketsWon);
     }
 
-    function fundBankroll(uint256 amount) external {
+    /// @notice Deposit USDC into the bankroll and mint shares proportional
+    /// to the pool they're buying into (first depositor mints 1:1). Shares
+    /// redeem via withdrawBankroll() for their proportional slice of
+    /// `bankroll` at withdrawal time - never more than what's actually
+    /// unreserved (active rounds' worst-case reservations are already
+    /// subtracted from `bankroll`, so a withdrawal can never touch funds a
+    /// live round is counting on).
+    ///
+    /// @dev Falls back to 1:1 minting when `bankroll == 0` even if
+    /// `totalShares > 0` (existing shares having been wiped out to zero
+    /// value - the classic empty-vault-after-a-loss edge case). That's a
+    /// simplification, not a fix: it avoids a division-by-zero revert but
+    /// doesn't protect the new depositor from immediately diluting into a
+    /// pool that may still owe value to existing (now-zero-value) shares.
+    /// Fine at hackathon scale; harden before real backer volume.
+    function fundBankroll(uint256 amount) external returns (uint256 sharesMinted) {
+        require(amount > 0, "fund at least something");
         require(usdc.transferFrom(msg.sender, address(this), amount), "usdc transfer failed");
+
+        sharesMinted = (totalShares == 0 || bankroll == 0) ? amount : (amount * totalShares) / bankroll;
+        require(sharesMinted > 0, "amount too small to mint a share");
+
+        backerShares[msg.sender] += sharesMinted;
+        totalShares += sharesMinted;
         bankroll += amount;
-        emit BankrollFunded(msg.sender, amount);
+
+        emit BankrollFunded(msg.sender, amount, sharesMinted);
+    }
+
+    /// @notice Burn shares for their proportional slice of the current
+    /// (unreserved) bankroll.
+    function withdrawBankroll(uint256 shares) external returns (uint256 amountOut) {
+        require(shares > 0 && shares <= backerShares[msg.sender], "insufficient shares");
+
+        amountOut = (shares * bankroll) / totalShares;
+        backerShares[msg.sender] -= shares;
+        totalShares -= shares;
+        bankroll -= amountOut;
+
+        require(usdc.transfer(msg.sender, amountOut), "usdc transfer failed");
+        emit BankrollWithdrawn(msg.sender, shares, amountOut);
+    }
+
+    /// @notice A backer's current shares valued at the live bankroll -
+    /// what withdrawBankroll(backerShares(backer)) would return right now.
+    function backerShareValue(address backer) external view returns (uint256) {
+        if (totalShares == 0) return 0;
+        return (backerShares[backer] * bankroll) / totalShares;
     }
 
     /// @notice Manual backstop for Push's Inco confidential-op ETH fee
