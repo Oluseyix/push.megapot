@@ -98,12 +98,32 @@ Confirmed and fixed in this pass:
   the reserve manually - both mechanisms from the "known gaps" list are
   implemented, not just one. See "Two real findings" below for why this is
   needed at all.
+- The off-chain SDK method to fetch a decryption attestation is
+  `Lightning.attestedDecrypt(walletClient, handles, opts?)` from
+  **`@inco/lightning-js`** (npm, latest `1.0.2` - same version the on-chain
+  `@inco/lightning` package here is verified against, fetched and inspected
+  directly from the published package's `.d.ts` files, not from memory or
+  docs). Get a bound instance via `Lightning.baseSepoliaTestnet()` (or
+  `.baseMainnet()` / `.at({name, chainId})`), then:
+  ```ts
+  const lightning = await Lightning.baseSepoliaTestnet();
+  const [attestation] = await lightning.attestedDecrypt(walletClient, [survivedHandle]);
+  // attestation: { handle: HexString, plaintext: {...}, covalidatorSignatures: Uint8Array[] }
+  ```
+  Maps directly onto `settleCashOut(roundId, attestation, signatures)`'s
+  on-chain `DecryptionAttestation{ handle, value }` struct (`handle` ->
+  `handle`, `plaintext` -> `value`, bytes32-encoded) plus a separate
+  `bytes[] signatures` param (`covalidatorSignatures` -> `signatures`) -
+  confirming the two-argument split in Push's `settleCashOut`/
+  `settleCommunityDraw` signatures matches what the SDK actually returns,
+  not just what `IncoTest`'s test-only `getDecryptionAttestation()` helper
+  happens to produce. There's also a lower-level `attestedDecrypt()` free
+  function (`@inco/lightning-js/attesteddecrypt`) that the `Lightning` class
+  method wraps - use the class method from a frontend; the free function
+  needs a `KmsQuorumClient` and reencryption keypair wired up manually.
 
 Still open, not verified against a live network:
 
-- The exact off-chain SDK method to fetch a decryption attestation (lives in
-  Inco's JS/TS SDK, not pulled down in this session - check
-  docs.inco.org/build-with-ai or the SDK package).
 - `TICKET_PRICE` is hardcoded at $1 - should read live from Megapot's
   `getDrawingState()` instead before deploying.
 - Yield distribution to bankroll backers is not implemented -
@@ -197,8 +217,10 @@ whether the bankroll is profitable over volume.
 
 ## Next steps
 
-1. Confirm the Inco SDK's attestation-fetch method, wire it into
-   `requestCashOut` -> off-chain fetch -> `settleCashOut`.
+1. ~~Confirm the Inco SDK's attestation-fetch method~~ Done -
+   `Lightning.attestedDecrypt()` from `@inco/lightning-js` (see "What's
+   verified vs. still open"). Still to do: actually wire it into the
+   frontend's `requestCashOut` -> off-chain fetch -> `settleCashOut` flow.
 2. ~~Add `inco.getFee()` payment handling if required.~~ Done -
    `stake()`/`requestCashOut()` self-fund the ETH fee reserve, plus a
    `receive()` manual backstop.
