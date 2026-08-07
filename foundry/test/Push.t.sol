@@ -17,9 +17,16 @@ contract PushTest is IncoTest {
     address referrer = address(0xBEEF);
 
     uint256 constant TICKET_PRICE = 1_000_000;
+    // Cached once here rather than called inline as `{value: incoFee}`
+    // at each call site: inco.getFee() is itself an external call, and
+    // evaluating it inline as part of a call's value expression is the
+    // "next call" that vm.prank/vm.expectRevert's single-shot cheatcodes
+    // attach to - not the push.stake()/requestCashOut() call after it.
+    uint256 incoFee;
 
     function setUp() public override {
         super.setUp(); // boots the full Inco fake infra - Safe deploy, TEE bootstrap, etc.
+        incoFee = inco.getFee();
 
         usdc = new MockUSDC();
         randomBuyer = new MockRandomTicketBuyer(usdc);
@@ -35,7 +42,11 @@ contract PushTest is IncoTest {
         tiers[6] = 20;
 
         push = new Push(address(randomBuyer), address(batchFacilitator), address(usdc), referrer, tiers);
-        vm.deal(address(push), 10 ether); // Inco charges confidential-op fees from the CONTRACT's own ETH balance
+        // Deployer's own initial top-up of Push's Inco confidential-op fee
+        // reserve (see Push.stake()'s docs) - a manual backstop via
+        // receive(), on top of the self-sustaining per-call top-ups tested
+        // separately below.
+        vm.deal(address(push), 10 ether);
 
         // Fund alice and bob to stake with, and give push a starting bankroll
         // by having a backer deposit real USDC first - stake() itself checks
@@ -44,6 +55,10 @@ contract PushTest is IncoTest {
         usdc.mint(alice, 10_000 * TICKET_PRICE);
         usdc.mint(bob, 10_000 * TICKET_PRICE);
         usdc.mint(address(this), 10_000 * TICKET_PRICE);
+
+        // ETH for alice/bob to pay Push's per-call Inco fee top-up with.
+        vm.deal(alice, 1 ether);
+        vm.deal(bob, 1 ether);
     }
 
     function _fundBankroll(uint256 dollars) internal {
@@ -61,7 +76,21 @@ contract PushTest is IncoTest {
         vm.startPrank(alice);
         usdc.approve(address(push), 1 * TICKET_PRICE);
         vm.expectRevert(bytes("bankroll can't cover this stake right now - try a smaller amount"));
-        push.stake(1);
+        push.stake{value: incoFee}(1);
+        vm.stopPrank();
+    }
+
+    function testStakeRevertsWithoutEthFeeReserveTopUp() public {
+        // Inco charges e.randBounded's fee from Push's own ETH balance, not
+        // from msg.value forwarded to Inco directly - so stake() requires
+        // its own msg.value floor to keep that reserve self-sustaining,
+        // independent of and checked before the USDC bankroll check above.
+        _fundBankroll(100);
+
+        vm.startPrank(alice);
+        usdc.approve(address(push), 1 * TICKET_PRICE);
+        vm.expectRevert(bytes("send enough ETH to cover the Inco confidential-op fee"));
+        push.stake(1); // no {value: ...} at all
         vm.stopPrank();
     }
 
@@ -70,7 +99,7 @@ contract PushTest is IncoTest {
 
         vm.startPrank(alice);
         usdc.approve(address(push), 1 * TICKET_PRICE);
-        uint256 roundId = push.stake(1);
+        uint256 roundId = push.stake{value: incoFee}(1);
         vm.stopPrank();
 
         // worst case for $1 staked, top tier 20x = $20 reserved
@@ -95,7 +124,7 @@ contract PushTest is IncoTest {
 
         vm.startPrank(alice);
         usdc.approve(address(push), 1 * TICKET_PRICE);
-        uint256 roundId = push.stake(1);
+        uint256 roundId = push.stake{value: incoFee}(1);
         vm.stopPrank();
 
         // Claiming the lowest tier (index 0) against a fresh deployment's
@@ -106,7 +135,7 @@ contract PushTest is IncoTest {
         uint8 claimedTierIndex = 0;
 
         vm.prank(alice);
-        push.requestCashOut(roundId, claimedTierIndex);
+        push.requestCashOut{value: incoFee}(roundId, claimedTierIndex);
         processAllOperations();
 
         bytes32 survivedHandle = push.pendingSurvivedHandle(roundId);
@@ -132,7 +161,7 @@ contract PushTest is IncoTest {
 
         vm.startPrank(alice);
         usdc.approve(address(push), 1 * TICKET_PRICE);
-        uint256 roundId = push.stake(1);
+        uint256 roundId = push.stake{value: incoFee}(1);
         vm.stopPrank();
 
         (,,, euint256 crashTierIndex,) = push.rounds(roundId);
@@ -148,7 +177,7 @@ contract PushTest is IncoTest {
         uint256 bankrollBefore = push.bankroll();
 
         vm.prank(alice);
-        push.requestCashOut(roundId, claimedTierIndex);
+        push.requestCashOut{value: incoFee}(roundId, claimedTierIndex);
         processAllOperations();
 
         bytes32 survivedHandle = push.pendingSurvivedHandle(roundId);
@@ -173,11 +202,11 @@ contract PushTest is IncoTest {
 
         vm.startPrank(alice);
         usdc.approve(address(push), 1 * TICKET_PRICE);
-        uint256 roundId = push.stake(1);
+        uint256 roundId = push.stake{value: incoFee}(1);
         vm.stopPrank();
 
         vm.prank(alice);
-        push.requestCashOut(roundId, 6); // top tier, will bust deterministically per above
+        push.requestCashOut{value: incoFee}(roundId, 6); // top tier, will bust deterministically per above
         processAllOperations();
 
         bytes32 survivedHandle = push.pendingSurvivedHandle(roundId);
@@ -195,12 +224,12 @@ contract PushTest is IncoTest {
 
         vm.startPrank(alice);
         usdc.approve(address(push), 1 * TICKET_PRICE);
-        uint256 roundId = push.stake(1);
+        uint256 roundId = push.stake{value: incoFee}(1);
         vm.stopPrank();
 
         vm.prank(bob);
         vm.expectRevert(bytes("not your round"));
-        push.requestCashOut(roundId, 0);
+        push.requestCashOut{value: incoFee}(roundId, 0);
     }
 
     // ============================================================
@@ -225,11 +254,11 @@ contract PushTest is IncoTest {
         // survive on its own, not because of the override).
         vm.startPrank(alice);
         usdc.approve(address(push), 15 * TICKET_PRICE);
-        uint256 roundId = push.stake(15);
+        uint256 roundId = push.stake{value: incoFee}(15);
         vm.stopPrank();
 
         vm.prank(alice);
-        push.requestCashOut(roundId, 0);
+        push.requestCashOut{value: incoFee}(roundId, 0);
         processAllOperations();
 
         bytes32 survivedHandle = push.pendingSurvivedHandle(roundId);
@@ -256,12 +285,12 @@ contract PushTest is IncoTest {
         // with $0.20 left un-spendable (division rounds down, tested below).
         vm.startPrank(alice);
         usdc.approve(address(push), 30 * TICKET_PRICE);
-        push.stake(30);
+        push.stake{value: incoFee}(30);
         vm.stopPrank();
 
         vm.startPrank(bob);
         usdc.approve(address(push), 30 * TICKET_PRICE);
-        push.stake(30);
+        push.stake{value: incoFee}(30);
         vm.stopPrank();
 
         uint256 expectedPot = push.communityPotBalance();
@@ -300,7 +329,7 @@ contract PushTest is IncoTest {
 
         vm.startPrank(alice);
         usdc.approve(address(push), 1 * TICKET_PRICE); // 2% of $1 = $0.02, nowhere near $1
-        push.stake(1);
+        push.stake{value: incoFee}(1);
         vm.stopPrank();
 
         uint256 periodId = push.requestCommunityDraw();

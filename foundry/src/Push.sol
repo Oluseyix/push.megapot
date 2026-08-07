@@ -95,6 +95,7 @@ contract Push {
     event Settled(uint256 indexed roundId, bool survived, uint256 ticketsWon);
     event BankrollFunded(address indexed backer, uint256 amount);
     event BatchOrderPending(address indexed recipient, uint256 count);
+    event EthFeeReserveToppedUp(address indexed from, uint256 amount);
 
     // ---------- Player stats / achievements ----------
 
@@ -187,8 +188,23 @@ contract Push {
     /// which must cover this round's worst case (stakedDollars * topTier)
     /// before the stake is accepted. This stake also counts as this
     /// period's weight toward the community draw below.
-    function stake(uint256 dollarAmount) external returns (uint256 roundId) {
+    ///
+    /// @dev Also self-funds Push's Inco confidential-op fee reserve: Inco
+    /// charges e.randBounded's fee from Push's OWN ETH balance
+    /// (address(this).call{value: fee}, not msg.value passed through to
+    /// Inco directly - see README "Two real findings"), so every call that
+    /// triggers a confidential op must leave the contract holding enough
+    /// ETH to pay for it or it reverts with CallFailedAfterFeeRefresh().
+    /// Requiring msg.value >= inco.getFee() (a floor, not an exact amount -
+    /// excess is never refunded and just stays in the contract's ETH
+    /// balance) keeps the reserve self-sustaining in proportion to play
+    /// volume, and lets a frontend pad its top-up slightly to build the
+    /// buffer requestCommunityDraw()'s two ops later draw down from, since
+    /// that call is meant to be permissionlessly keeper-automatable without
+    /// the keeper needing to hold ETH themselves.
+    function stake(uint256 dollarAmount) external payable returns (uint256 roundId) {
         require(dollarAmount > 0, "stake at least $1");
+        require(msg.value >= inco.getFee(), "send enough ETH to cover the Inco confidential-op fee");
         uint256 totalCost = dollarAmount * TICKET_PRICE;
         require(usdc.transferFrom(msg.sender, address(this), totalCost), "usdc transfer failed");
 
@@ -219,11 +235,14 @@ contract Push {
         emit RoundStarted(roundId, msg.sender, dollarAmount);
     }
 
-    function requestCashOut(uint256 roundId, uint8 claimedTierIndex) external {
+    /// @dev Same ETH-fee-reserve requirement as stake() - this triggers
+    /// e.lt(), a second confidential op paid from Push's own ETH balance.
+    function requestCashOut(uint256 roundId, uint8 claimedTierIndex) external payable {
         Round storage r = rounds[roundId];
         require(r.player == msg.sender, "not your round");
         require(!r.settled, "already settled");
         require(claimedTierIndex < tiers.length, "bad tier");
+        require(msg.value >= inco.getFee(), "send enough ETH to cover the Inco confidential-op fee");
 
         ebool survived = e.lt(claimedTierIndex, r.crashTierIndex);
         e.allow(survived, msg.sender);
@@ -290,6 +309,16 @@ contract Push {
         require(usdc.transferFrom(msg.sender, address(this), amount), "usdc transfer failed");
         bankroll += amount;
         emit BankrollFunded(msg.sender, amount);
+    }
+
+    /// @notice Manual backstop for Push's Inco confidential-op ETH fee
+    /// reserve - separate from the USDC bankroll above. stake() and
+    /// requestCashOut() keep this reserve self-sustaining under normal play
+    /// volume, but the deployer (or anyone) can top it up directly here,
+    /// e.g. ahead of a requestCommunityDraw() call if the reserve is running
+    /// low between rounds.
+    receive() external payable {
+        emit EthFeeReserveToppedUp(msg.sender, msg.value);
     }
 
     // ============================================================

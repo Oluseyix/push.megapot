@@ -85,13 +85,25 @@ test (not from memory or docs alone):
   let other players learn each other's outcomes. `allow()` is scoped to one
   address.
 
+Confirmed and fixed in this pass:
+
+- `e.randBounded` / `e.lt` (via `e.allowThis`/`e.allow`) DO require an
+  `inco.getFee()` payment, taken from Push's own ETH balance, not from
+  `msg.value` forwarded to Inco directly (`Fee.sol`: `FEE = 0.000001 ether`,
+  a fixed constant, read via `inco.getFee()` rather than hardcoded per
+  Inco's own guidance since it "may change through contract upgrades").
+  `stake()` and `requestCashOut()` are now `payable` and each require
+  `msg.value >= inco.getFee()` as a self-sustaining top-up of that reserve;
+  a `receive()` fallback is also open for the deployer (or anyone) to top up
+  the reserve manually - both mechanisms from the "known gaps" list are
+  implemented, not just one. See "Two real findings" below for why this is
+  needed at all.
+
 Still open, not verified against a live network:
 
 - The exact off-chain SDK method to fetch a decryption attestation (lives in
   Inco's JS/TS SDK, not pulled down in this session - check
   docs.inco.org/build-with-ai or the SDK package).
-- Whether `e.randBounded` / `e.allow` require an `inco.getFee()` payment -
-  seen required in other Inco reference contracts, not confirmed here.
 - `TICKET_PRICE` is hardcoded at $1 - should read live from Megapot's
   `getDrawingState()` instead before deploying.
 - Yield distribution to bankroll backers is not implemented -
@@ -187,36 +199,70 @@ whether the bankroll is profitable over volume.
 
 1. Confirm the Inco SDK's attestation-fetch method, wire it into
    `requestCashOut` -> off-chain fetch -> `settleCashOut`.
-2. Add `inco.getFee()` payment handling if required.
+2. ~~Add `inco.getFee()` payment handling if required.~~ Done -
+   `stake()`/`requestCashOut()` self-fund the ETH fee reserve, plus a
+   `receive()` manual backstop.
 3. Replace hardcoded `TICKET_PRICE` with a live `getDrawingState()` read.
 4. Design and implement bankroll backer shares/yield.
-5. Write Foundry tests against Inco's `IncoTest` base contract before
-   touching testnet.
+5. ~~Write Foundry tests against Inco's `IncoTest` base contract before
+   touching testnet.~~ Done - see "Test suite" below.
 
 ## Compiling - verified working
 
 This contract **compiles cleanly** against the real `@inco/lightning` v1.0.2
-package and real OpenZeppelin dependencies - confirmed with Foundry in this
-session, not just written and assumed correct.
+package and real OpenZeppelin dependencies - confirmed with Foundry (10/10
+tests passing) in a network-restricted sandbox, not just written and assumed
+correct.
 
 ```
 cd foundry
-npm install
+npm install --ignore-scripts   # see below for why --ignore-scripts
 forge build
+forge test --match-contract PushTest
 ```
 
-If `forge build` tries to auto-download solc and fails (some sandboxed
-environments block `binaries.soliditylang.org`), that's a network
-restriction, not a contract problem - fetch a static solc binary directly
-from GitHub releases instead and point `foundry.toml`'s `solc` field at it:
+`foundry.toml` uses `libs = ["node_modules"]` plus explicit `remappings`
+(rather than `forge install`/git submodules) since dependencies are npm
+packages: `@inco/lightning`, `@openzeppelin/contracts(-upgradeable)`, and
+`@safe-global/safe-smart-account` (Inco's `IncoTest` harness deploys a real
+Safe multisig as part of its fake infra). `forge-std` also comes from
+`node_modules` (an `@inco/lightning` dependency) rather than a submodule.
+
+**`--ignore-scripts` is required, not optional, in a sandbox that blocks
+`binaries.soliditylang.org`:** `@safe-global/safe-smart-account`'s own
+`prepare` script runs a Hardhat build that tries to download a solc version
+list from that host and fails the entire `npm install` otherwise. Its
+prebuilt contract sources (all this project needs) are unaffected -
+`--ignore-scripts` just skips that unnecessary Hardhat build.
+
+**If `forge build`'s own solc auto-download also fails** (same restriction,
+via `binaries.soliditylang.org`) - this is a network restriction, not a
+contract problem - fetch the static solc binary directly from a GitHub
+*release asset* instead. In this sandbox, `binaries.soliditylang.org` and
+`foundry.paradigm.xyz` (foundryup's installer) were both blocked by egress
+policy, but direct `https://github.com/.../releases/download/...` URLs were
+not - only some GitHub *page* routes (e.g. `github.com/.../releases`, the
+`api.github.com` REST API) returned non-2xx; asset download URLs and `git
+clone`/`git ls-remote` against `github.com` worked fine. Worth trying that
+distinction before concluding GitHub is unreachable:
 
 ```
-curl -sL https://github.com/ethereum/solidity/releases/download/v0.8.35/solc-static-linux -o /path/to/solc && chmod +x /path/to/solc
-# then set solc = "/path/to/solc" in foundry.toml
+# forge/cast/anvil itself, if foundryup is blocked - pick a tag from:
+# git ls-remote --tags --refs https://github.com/foundry-rs/foundry.git
+curl -sL https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz -o foundry.tar.gz
+mkdir -p ~/.foundry/bin && tar -xzf foundry.tar.gz -C ~/.foundry/bin && chmod +x ~/.foundry/bin/*
+export PATH="$HOME/.foundry/bin:$PATH"
+
+# solc itself
+curl -sL https://github.com/ethereum/solidity/releases/download/v0.8.35/solc-static-linux -o solc-0.8.35 && chmod +x solc-0.8.35
+mkdir -p ~/.svm/0.8.35 && cp solc-0.8.35 ~/.svm/0.8.35/solc-0.8.35
+# foundry.toml already has solc_version = "0.8.35" - Foundry's svm resolver
+# picks up the manually-placed binary from ~/.svm without touching the
+# network, since it only downloads a version it can't already find cached.
 ```
 
-On a normal, unrestricted machine, just delete the `solc` line from
-`foundry.toml` and Foundry's own installer will handle it.
+On a normal, unrestricted machine, none of this is necessary - plain
+`npm install` and `forge build` handle everything themselves.
 
 **One real, non-cosmetic fix this compile pass caught:** the ticket-purchase
 helper originally cast `count` straight to `uint64` for
@@ -229,7 +275,7 @@ concern for a value that scales with player stake. Fixed with an explicit
 coverage - see "Next steps" above for the `IncoTest` base-contract pattern
 to write them against.
 
-## Test suite - 9/9 passing, against the real Inco harness
+## Test suite - 10/10 passing, against the real Inco harness
 
 `foundry/test/Push.t.sol` tests Push against Inco's own real `IncoTest` base
 contract (full fake infra: Safe multisig deploy, TEE bootstrap simulation,
@@ -243,10 +289,12 @@ cd foundry
 forge test --match-contract PushTest
 ```
 
-Covers: solvency rejection when the bankroll can't cover worst case, correct
-reserve/release accounting on both survive and crash outcomes, player stats
-and streak tracking, double-settlement protection, cashout access control,
-correct routing to the batch facilitator above 10 tickets, and the community
+Covers: solvency rejection when the bankroll can't cover worst case,
+rejection when the caller doesn't top up Push's Inco ETH fee reserve,
+correct reserve/release accounting on both survive and crash outcomes,
+player stats and streak tracking, double-settlement protection, cashout
+access control, correct routing to the batch facilitator above 10 tickets,
+and the community
 pool paying out exactly what it accumulated - including the small-pot case
 that correctly buys zero tickets rather than reverting or over-promising.
 
@@ -259,10 +307,13 @@ Push's own ETH balance, not `msg.value` from whoever called Push. **This is
 a real, previously-undocumented deployment requirement**: Push needs to hold
 enough ETH to cover its own confidential-op fees (one `randBounded` per
 stake, one `lt` per cashout request), or every `stake()`/`requestCashOut()`
-call reverts with `CallFailedAfterFeeRefresh()`. Needs a funding mechanism
-before mainnet deployment - either the deployer tops it up periodically, or
-`stake()` collects a small ETH fee from the player to self-sustain. Not
-implemented yet - flagged here rather than guessed at.
+call reverts with `CallFailedAfterFeeRefresh()`. **Fixed**: `stake()` and
+`requestCashOut()` are now `payable` and require `msg.value >= inco.getFee()`,
+self-sustaining the reserve in proportion to play volume (any msg.value
+above the floor is never refunded, so a frontend can pad it slightly to
+build a buffer for `requestCommunityDraw()`'s own two ops, which aren't
+tied to a single caller's payment). A `receive()` fallback is also open as
+a manual backstop for the deployer or anyone else to top up directly.
 
 **2. `KVStore.set()` does NOT let a test override an already-computed
 on-chain confidential value.** Early drafts of these tests tried to force a
@@ -281,7 +332,6 @@ documented in the test file itself so this mistake doesn't get repeated.
 
 - Integration testing against real deployed Megapot contracts (mocks only,
   even though the mocks enforce real constraints)
-- The Inco ETH-fee funding mechanism itself (identified above, not built)
 - Fuzz testing on the tier/probability curve math
 - Gas profiling on `settleCommunityDraw`'s O(n) participant loop at realistic
   scale
