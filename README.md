@@ -419,3 +419,51 @@ documented in the test file itself so this mistake doesn't get repeated.
 - Fuzz testing on the tier/probability curve math
 - Gas profiling on `settleCommunityDraw`'s O(n) participant loop at realistic
   scale
+
+## Deploying (Base Sepolia)
+
+`foundry/script/DeployPush.s.sol` deploys Push with the real Base Sepolia
+Megapot addresses (see "Megapot contract addresses" above) and seeds its
+own ETH balance so the Inco confidential-op fee reserve is usable
+immediately (gap 1 - see "Two real findings").
+
+Note on the Inco address: Push.sol's plain `Lib.sol` import (not
+`Lib.testnet.sol`) is correct here, not a bug - confirmed against
+`@inco/lightning`'s own `manifest.yaml`, which shows the "mainnet" pepper
+release (the one `Lib.sol` hardcodes, `0x4b99...8624`) is deployed and
+`active: true` on **both** Base mainnet (8453) *and* Base Sepolia (84532)
+at the same address via CREATE2. `Lib.testnet.sol` is a different Inco
+release track entirely, not "the address for the chain named Base
+Sepolia" - don't switch the import when deploying to Base Sepolia.
+
+```sh
+cd foundry
+export PRIVATE_KEY=0x...          # deployer key, funded with Base Sepolia ETH
+export REFERRER_ADDRESS=0x...     # your wallet - earns referral fees on every ticket bought through Push
+forge script script/DeployPush.s.sol:DeployPush \
+  --rpc-url https://sepolia.base.org \
+  --broadcast
+```
+
+Get Base Sepolia ETH from a faucet (e.g.
+[Alchemy's](https://www.alchemy.com/faucets/base-sepolia)) before running -
+the deployer key needs enough for deployment gas plus the script's
+`INITIAL_ETH_SEED` (0.01 ETH by default).
+
+After it deploys:
+
+1. Set `VITE_PUSH_ADDRESS` in `frontend/.env` to the printed address.
+2. Get Base Sepolia test USDC and call `fundBankroll(amount)` - `stake()`
+   rejects every stake until the bankroll can cover at least a $1 stake's
+   worst case (top tier x $1 x number of tiers).
+3. Deploy the frontend (`frontend/`) somewhere public - it's a static Vite
+   build (`pnpm run build`), so any static host (Vercel, Netlify,
+   Cloudflare Pages) works.
+4. Confirm on the Summer Game Jam Telegram whether testnet qualifies for
+   the Megapot track submission or mainnet is required - still open as of
+   this session.
+
+The script's dry-run mechanics (deploy + ETH seed transfer) were verified
+against a local Anvil chain in this session - not against live Base
+Sepolia, since this sandbox's network egress doesn't reach public chain
+RPCs. Run it for real from an environment that can.
