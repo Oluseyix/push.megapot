@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Apply the configured system font stack to the whole app — without this
+     the body falls back to the platform default (Times New Roman on Windows). */
+  html {
+    @apply font-sans antialiased;
+  }
+
+  /* Single, consistent focus ring across every interactive element. Tab through
+     the app and you should always see where focus is. The ring uses
+     `box-shadow`, so each element keeps its native border-radius (pills stay
+     round, cards stay rounded-2xl) — no `rounded-*` override here. */
+  :where(button, a, [role="button"], summary, input, select, textarea):focus-visible {
+    @apply outline-none ring-2 ring-brand-primary-500 ring-offset-2 ring-offset-white dark:ring-offset-zinc-950;
+  }
+}
+
+@layer components {
+  /* The repeating card chrome used across pages — extracted so a fork can
+     restyle every card by editing one place. */
+  .card {
+    @apply rounded-2xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900;
+  }
+  .card-pad {
+    @apply card p-4;
+  }
+  .card-pad-lg {
+    @apply card p-6 shadow-sm;
+  }
+}
+
+/* Push/climb screen animations. Pure presentation - see
+   components/climb/ClimbStage.tsx's header comment for why these never
+   touch the real sealed outcome. */
+@keyframes push-teeter {
+  0%,
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  30% {
+    transform: translateY(6px) rotate(-3deg);
+  }
+  60% {
+    transform: translateY(2px) rotate(2deg);
+  }
+}
+.animate-push-teeter {
+  animation: push-teeter 420ms ease-in-out;
+}
+
+@keyframes push-ticket-up {
+  0% {
+    opacity: 1;
+    transform: translate(var(--dx-start), 0) rotate(0deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--dx-end), -90px) rotate(var(--rot));
+  }
+}
+.animate-push-ticket-up {
+  animation: push-ticket-up 900ms ease-out forwards;
+}
+
+@keyframes push-ticket-spill {
+  0% {
+    opacity: 1;
+    transform: translate(var(--dx-start), 0) rotate(0deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--dx-end), 90px) rotate(var(--rot));
+  }
+}
+.animate-push-ticket-spill {
+  animation: push-ticket-spill 900ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+
+@keyframes push-pot-tip {
+  0% {
+    transform: rotate(0deg) translateY(0);
+  }
+  40% {
+    transform: rotate(18deg) translateY(4px);
+  }
+  100% {
+    transform: rotate(28deg) translateY(20px);
+  }
+}
+.animate-push-pot-tip {
+  animation: push-pot-tip 700ms cubic-bezier(0.4, 0, 0.6, 1) forwards;
+}
+
+@keyframes push-pot-glow {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 0 rgba(16, 185, 129, 0));
+  }
+  50% {
+    filter: drop-shadow(0 0 14px rgba(16, 185, 129, 0.55));
+  }
+}
+.animate-push-pot-glow {
+  animation: push-pot-glow 1.1s ease-in-out infinite;
+}
