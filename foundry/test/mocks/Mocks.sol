@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {DrawingState, BatchOrderInfo, StaticTicket} from "../../src/Push.sol";
+
 contract MockUSDC {
     string public name = "USD Coin";
     string public symbol = "USDC";
@@ -27,51 +29,47 @@ contract MockUSDC {
     }
 }
 
-struct Push_StaticTicket {
-    uint8[] normals;
-    uint8 bonusball;
-}
+/// @dev Mimics Jackpot.getDrawingState()/.currentDrawingId() closely enough
+/// for unit tests - just the live ticket price Push actually reads, settable
+/// per test. Confirmed against megapot-starter-kit's useJackpotState.ts.
+contract MockJackpot {
+    uint256 public currentDrawingId = 1;
+    uint256 public ticketPrice = 1_000_000; // $1 USDC, 6 decimals - matches Megapot's real default
 
-/// @dev Mimics JackpotRandomTicketBuyer's real behavior closely enough for
-/// unit tests: pulls exactly count * $1 from the caller and records the
-/// purchase. Real contract caps count at 10 - this mock enforces that too so
-/// tests catch a Push bug that tries to route a >10 order here by mistake.
-contract MockRandomTicketBuyer {
-    uint256 constant TICKET_PRICE = 1_000_000;
-    MockUSDC public usdc;
-
-    address public lastRecipient;
-    uint256 public lastCount;
-    uint256 public callCount;
-
-    constructor(MockUSDC _usdc) {
-        usdc = _usdc;
+    function setTicketPrice(uint256 _price) external {
+        ticketPrice = _price;
     }
 
-    function buyTickets(
-        uint256 _count,
-        address _recipient,
-        address[] calldata,
-        uint256[] calldata,
-        bytes32
-    ) external returns (uint256[] memory ticketIds) {
-        require(_count >= 1 && _count <= 10, "InvalidTicketCount");
-        require(usdc.transferFrom(msg.sender, address(this), _count * TICKET_PRICE), "usdc pull failed");
-        lastRecipient = _recipient;
-        lastCount = _count;
-        callCount += 1;
-        ticketIds = new uint256[](_count);
+    function getDrawingState(uint256) external view returns (DrawingState memory) {
+        return DrawingState({
+            prizePool: 0,
+            ticketPrice: ticketPrice,
+            edgePerTicket: 0,
+            referralWinShare: 0,
+            referralFee: 0,
+            globalTicketsBought: 0,
+            lpEarnings: 0,
+            drawingTime: 0,
+            winningTicket: 0,
+            ballMax: 30,
+            bonusballMax: 1,
+            payoutCalculator: address(0),
+            jackpotLock: false
+        });
     }
 }
 
 /// @dev Mimics BatchPurchaseFacilitator closely enough for unit tests: pulls
-/// count * $1, enforces the real one-active-order-per-recipient constraint,
-/// and enforces the real >=10 minimum.
+/// count * live ticket price, and enforces the real one-active-order-per-
+/// recipient constraint via remainingTickets (see Push.sol's
+/// BatchOrderInfo/IBatchPurchaseFacilitator comments for why - there's no
+/// separate hasActiveBatchOrder() getter or confirmed minimumTicketCount()
+/// on the real contract, so this mock doesn't invent one either).
 contract MockBatchFacilitator {
-    uint256 constant TICKET_PRICE = 1_000_000;
     MockUSDC public usdc;
+    uint256 public ticketPrice = 1_000_000; // kept in sync with MockJackpot's by tests that change it
 
-    mapping(address => bool) public hasActiveBatchOrder;
+    mapping(address => BatchOrderInfo) private orders;
     address public lastRecipient;
     uint256 public lastDynamicCount;
     uint256 public callCount;
@@ -80,31 +78,53 @@ contract MockBatchFacilitator {
         usdc = _usdc;
     }
 
-    function minimumTicketCount() external pure returns (uint256) {
-        return 10;
+    function setTicketPrice(uint256 _price) external {
+        ticketPrice = _price;
     }
 
     function createBatchOrder(
         address _recipient,
         uint64 _dynamicTicketCount,
-        Push_StaticTicket[] calldata _userStaticTickets,
+        StaticTicket[] calldata _userStaticTickets,
         address[] calldata,
         uint256[] calldata,
         bytes32
     ) external {
-        require(!hasActiveBatchOrder[_recipient], "ActiveBatchOrderExists");
+        require(orders[_recipient].remainingTickets == 0, "ActiveBatchOrderExists");
         uint256 total = uint256(_dynamicTicketCount) + _userStaticTickets.length;
-        require(total >= 10, "InvalidTicketCount");
-        require(usdc.transferFrom(msg.sender, address(this), total * TICKET_PRICE), "usdc pull failed");
-        hasActiveBatchOrder[_recipient] = true;
+        require(total > 0, "InvalidTicketCount");
+        uint256 cost = total * ticketPrice;
+        require(usdc.transferFrom(msg.sender, address(this), cost), "usdc pull failed");
+
+        orders[_recipient] = BatchOrderInfo({
+            orderDrawingId: 0,
+            // forge-lint: disable-next-line(unsafe-typecast)
+            remainingUSDC: uint64(cost),
+            // forge-lint: disable-next-line(unsafe-typecast)
+            remainingTickets: uint64(total),
+            // forge-lint: disable-next-line(unsafe-typecast)
+            totalTicketsOrdered: uint64(total),
+            dynamicTicketCount: _dynamicTicketCount,
+            referrers: new address[](0),
+            referralSplit: new uint256[](0)
+        });
         lastRecipient = _recipient;
         lastDynamicCount = _dynamicTicketCount;
         callCount += 1;
     }
 
+    function getBatchOrderInfo(address _recipient)
+        external
+        view
+        returns (BatchOrderInfo memory batchOrder, StaticTicket[] memory staticTickets)
+    {
+        batchOrder = orders[_recipient];
+        staticTickets = new StaticTicket[](0);
+    }
+
     /// @dev Test helper only - simulates the keeper finishing execution so
     /// a later round for the same player isn't blocked forever in tests.
     function simulateKeeperCompletion(address recipient) external {
-        hasActiveBatchOrder[recipient] = false;
+        orders[recipient].remainingTickets = 0;
     }
 }

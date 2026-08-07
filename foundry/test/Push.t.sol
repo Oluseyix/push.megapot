@@ -6,16 +6,18 @@ import {inco, euint256, ebool} from "@inco/lightning/src/Lib.sol";
 import {DecryptionAttestation} from "@inco/lightning/src/lightning-parts/DecryptionAttester.types.sol";
 import {Push} from "../src/Push.sol";
 import {console} from "forge-std/console.sol";
-import {MockUSDC, MockRandomTicketBuyer, MockBatchFacilitator} from "./mocks/Mocks.sol";
+import {MockUSDC, MockJackpot, MockBatchFacilitator} from "./mocks/Mocks.sol";
 
 contract PushTest is IncoTest {
 
     Push push;
     MockUSDC usdc;
-    MockRandomTicketBuyer randomBuyer;
+    MockJackpot jackpot;
     MockBatchFacilitator batchFacilitator;
     address referrer = address(0xBEEF);
 
+    // Matches MockJackpot's default ticketPrice - Push.sol no longer has its
+    // own TICKET_PRICE constant, it reads this live via ticketPrice().
     uint256 constant TICKET_PRICE = 1_000_000;
     // Cached once here rather than called inline as `{value: incoFee}`
     // at each call site: inco.getFee() is itself an external call, and
@@ -29,7 +31,7 @@ contract PushTest is IncoTest {
         incoFee = inco.getFee();
 
         usdc = new MockUSDC();
-        randomBuyer = new MockRandomTicketBuyer(usdc);
+        jackpot = new MockJackpot();
         batchFacilitator = new MockBatchFacilitator(usdc);
 
         uint256[] memory tiers = new uint256[](7);
@@ -41,7 +43,7 @@ contract PushTest is IncoTest {
         tiers[5] = 12;
         tiers[6] = 20;
 
-        push = new Push(address(randomBuyer), address(batchFacilitator), address(usdc), referrer, tiers);
+        push = new Push(address(jackpot), address(batchFacilitator), address(usdc), referrer, tiers);
         // Deployer's own initial top-up of Push's Inco confidential-op fee
         // reserve (see Push.stake()'s docs) - a manual backstop via
         // receive(), on top of the self-sustaining per-call top-ups tested
@@ -103,7 +105,7 @@ contract PushTest is IncoTest {
         vm.stopPrank();
 
         // worst case for $1 staked, top tier 20x = $20 reserved
-        (,, uint256 reserved,,) = push.rounds(roundId);
+        (,, uint256 reserved,,,) = push.rounds(roundId);
         assertEq(reserved, 20 * TICKET_PRICE, "should reserve top-tier worst case");
 
         // bankroll should be original 100 - 20 reserved - 2% skim on the $1 stake
@@ -144,8 +146,11 @@ contract PushTest is IncoTest {
 
         push.settleCashOut(roundId, attestation, signatures);
 
-        assertEq(randomBuyer.lastRecipient(), alice, "tickets should go to alice");
-        assertEq(randomBuyer.lastCount(), 1, "tier 0 = 1x on a $1 stake = 1 ticket");
+        // All purchases route through the batch facilitator now - there is
+        // no real on-chain "buy N random tickets" contract to route small
+        // orders through instead (see Push.sol's BatchOrderInfo comment).
+        assertEq(batchFacilitator.lastRecipient(), alice, "tickets should go to alice");
+        assertEq(batchFacilitator.lastDynamicCount(), 1, "tier 0 = 1x on a $1 stake = 1 ticket");
 
         (uint256 currentStreak, uint256 longestStreak, uint256 bestTier, uint256 totalTicketsWon, uint256 totalCashouts,) =
             push.playerStats(alice);
@@ -164,7 +169,7 @@ contract PushTest is IncoTest {
         uint256 roundId = push.stake{value: incoFee}(1);
         vm.stopPrank();
 
-        (,,, euint256 crashTierIndex,) = push.rounds(roundId);
+        (,,, euint256 crashTierIndex,,) = push.rounds(roundId);
         uint256 actualCrashTier = uint256(get(euint256.unwrap(crashTierIndex)));
 
         // Claim the top tier (index 6) - survives only if actualCrashTier > 6,
@@ -186,10 +191,9 @@ contract PushTest is IncoTest {
 
         push.settleCashOut(roundId, attestation, signatures);
 
-        assertEq(randomBuyer.callCount(), 0, "no tickets should be bought on a bust");
         assertEq(batchFacilitator.callCount(), 0, "no tickets should be bought on a bust");
 
-        (,, uint256 reserved,,) = push.rounds(roundId);
+        (,, uint256 reserved,,,) = push.rounds(roundId);
         assertEq(push.bankroll(), bankrollBefore + reserved, "full reservation should return to bankroll on bust");
 
         (uint256 currentStreak,,,,, uint256 totalCrashes) = push.playerStats(alice);
@@ -233,25 +237,27 @@ contract PushTest is IncoTest {
     }
 
     // ============================================================
-    // Large payout routing: this is the exact bug the pasted Megapot docs
-    // caught earlier in the conversation - anything over 10 tickets MUST
-    // route through the batch facilitator, not the random buyer.
+    // Ticket purchase routing: every purchase (whether 1 ticket or many)
+    // routes through BatchPurchaseFacilitator.createBatchOrder - there is
+    // no separate on-chain "random ticket buyer" contract for small orders
+    // (see Push.sol's BatchOrderInfo comment for the real ABI this was
+    // confirmed against). One active order per recipient at a time is
+    // enforced via remainingTickets, not a dedicated boolean getter.
     // ============================================================
 
-    function testLargePayoutRoutesThroughBatchFacilitatorNotRandomBuyer() public {
+    function testLargePayoutRoutesThroughBatchFacilitator() public {
         _fundBankroll(5000);
 
         // Stake $15 and claim the lowest tier (index 0, value 1x). This tier
         // is empirically confirmed to survive as the first confidential draw
         // in a fresh deployment (see testCashOutOnSurviveBuysTicketsAndUpdatesStats).
-        // 15 dollars * 1x = 15 tickets - already over the 10-ticket cap
-        // without needing to survive any higher tier, which sidesteps trying
-        // to force a specific value into an on-chain-computed confidential
-        // result (see README note: KVStore.set() only affects the test
-        // harness's off-chain attestation simulation cache, not the real
-        // on-chain eRandBounded/eLt computation - it looked effective in an
-        // earlier draft only because that computation happened to genuinely
-        // survive on its own, not because of the override).
+        // 15 dollars * 1x = 15 tickets, sidestepping the need to force a
+        // specific value into an on-chain-computed confidential result (see
+        // README note: KVStore.set() only affects the test harness's
+        // off-chain attestation simulation cache, not the real on-chain
+        // eRandBounded/eLt computation - it looked effective in an earlier
+        // draft only because that computation happened to genuinely survive
+        // on its own, not because of the override).
         vm.startPrank(alice);
         usdc.approve(address(push), 15 * TICKET_PRICE);
         uint256 roundId = push.stake{value: incoFee}(15);
@@ -267,10 +273,56 @@ contract PushTest is IncoTest {
 
         push.settleCashOut(roundId, attestation, signatures);
 
-        assertEq(randomBuyer.callCount(), 0, "15 tickets must NOT go through the 10-ticket-capped random buyer");
         assertEq(batchFacilitator.callCount(), 1, "15 tickets must route through the batch facilitator");
         assertEq(batchFacilitator.lastDynamicCount(), 15);
         assertEq(batchFacilitator.lastRecipient(), alice);
+    }
+
+    function testCashOutRevertsWhenRecipientHasPendingBatchOrder() public {
+        _fundBankroll(5000);
+
+        // First round: survive at the lowest tier, creating a batch order
+        // for alice that the mock keeper never completes.
+        vm.startPrank(alice);
+        usdc.approve(address(push), 1 * TICKET_PRICE);
+        uint256 firstRoundId = push.stake{value: incoFee}(1);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        push.requestCashOut{value: incoFee}(firstRoundId, 0);
+        processAllOperations();
+
+        bytes32 firstHandle = push.pendingSurvivedHandle(firstRoundId);
+        (DecryptionAttestation memory firstAttestation, bytes[] memory firstSignatures) =
+            getDecryptionAttestation(alice, HandleWithProof({handle: firstHandle, proof: _emptyAllowanceProof()}));
+        push.settleCashOut(firstRoundId, firstAttestation, firstSignatures);
+        assertEq(batchFacilitator.callCount(), 1, "first win should have created a batch order");
+
+        // Second round, same player: also survives, but the first order is
+        // still pending (mock keeper hasn't filled it) - settling should
+        // revert rather than silently create a second order Megapot itself
+        // would reject.
+        vm.startPrank(alice);
+        usdc.approve(address(push), 1 * TICKET_PRICE);
+        uint256 secondRoundId = push.stake{value: incoFee}(1);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        push.requestCashOut{value: incoFee}(secondRoundId, 0);
+        processAllOperations();
+
+        bytes32 secondHandle = push.pendingSurvivedHandle(secondRoundId);
+        (DecryptionAttestation memory secondAttestation, bytes[] memory secondSignatures) =
+            getDecryptionAttestation(alice, HandleWithProof({handle: secondHandle, proof: _emptyAllowanceProof()}));
+
+        vm.expectRevert(bytes("recipient already has tickets pending from a previous win"));
+        push.settleCashOut(secondRoundId, secondAttestation, secondSignatures);
+
+        // Once the mock keeper "completes" the first order, the same
+        // settlement should succeed.
+        batchFacilitator.simulateKeeperCompletion(alice);
+        push.settleCashOut(secondRoundId, secondAttestation, secondSignatures);
+        assertEq(batchFacilitator.callCount(), 2, "second win should go through once the first order clears");
     }
 
     // ============================================================
@@ -305,12 +357,10 @@ contract PushTest is IncoTest {
         );
 
         uint256 batchBefore = usdc.balanceOf(address(batchFacilitator));
-        uint256 randomBefore = usdc.balanceOf(address(randomBuyer));
 
         push.settleCommunityDraw(periodId, attestation, signatures);
 
-        uint256 spent = (usdc.balanceOf(address(batchFacilitator)) - batchBefore)
-            + (usdc.balanceOf(address(randomBuyer)) - randomBefore);
+        uint256 spent = usdc.balanceOf(address(batchFacilitator)) - batchBefore;
         // $1.20 pot only buys 1 whole ticket (integer division) - the extra
         // $0.20 is real, intentional rounding dust, not spent or lost.
         assertEq(spent, 1 * TICKET_PRICE, "payout must be exactly 1 ticket - never more than the pot allows");
@@ -339,12 +389,10 @@ contract PushTest is IncoTest {
         );
 
         uint256 batchBefore = usdc.balanceOf(address(batchFacilitator));
-        uint256 randomBefore = usdc.balanceOf(address(randomBuyer));
 
         push.settleCommunityDraw(periodId, attestation, signatures); // must not revert
 
-        uint256 spent = (usdc.balanceOf(address(batchFacilitator)) - batchBefore)
-            + (usdc.balanceOf(address(randomBuyer)) - randomBefore);
+        uint256 spent = usdc.balanceOf(address(batchFacilitator)) - batchBefore;
         assertEq(spent, 0, "a sub-$1 pot should buy nothing, not revert and not over-promise");
     }
 

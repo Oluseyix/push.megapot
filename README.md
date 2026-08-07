@@ -24,8 +24,9 @@ backer-funded liquidity).
    via Inco - the animation is pure presentation and never influences or
    reveals it.
 3. **Cash out**, any time: the contract buys `stakedDollars * tier` real
-   random-number Megapot tickets (via `JackpotRandomTicketBuyer`), same odds
-   and same prize structure as any ticket bought directly on megapot.io.
+   random-number Megapot tickets (via `BatchPurchaseFacilitator`, which
+   generates the actual ticket numbers itself), same odds and same prize
+   structure as any ticket bought directly on megapot.io.
 4. **Crash before cashing out**: zero tickets. The stake stays in the
    bankroll. This is the real loss - there is no refund, no consolation
    ticket, nothing returned.
@@ -121,11 +122,39 @@ Confirmed and fixed in this pass:
   function (`@inco/lightning-js/attesteddecrypt`) that the `Lightning` class
   method wraps - use the class method from a frontend; the free function
   needs a `KmsQuorumClient` and reencryption keypair wired up manually.
+- `TICKET_PRICE` was hardcoded at $1 - now read live via `ticketPrice()`,
+  which calls `Jackpot.getDrawingState(Jackpot.currentDrawingId())` and
+  returns its `ticketPrice` field. Confirmed signature (not docs, not
+  memory) from `megapot-starter-kit`'s own `src/hooks/useJackpotState.ts` -
+  `getDrawingState` takes a `_drawingId`, it's not parameterless. Locked in
+  per-round at stake time (`Round.ticketPriceAtStake`) rather than re-read
+  at settle time, so a live price move between stake and settle can't
+  underflow `reserved - cost` and revert a legitimate win.
+- **`JackpotRandomTicketBuyer` does not exist.** Verifying the
+  `getDrawingState` signature above (by cloning and reading
+  `megapot-starter-kit` directly, the same kit these task instructions
+  point to as the frontend base - not just its docs) surfaced a bigger
+  problem: there is no on-chain "buy N random tickets" contract on the real
+  protocol at all. `Jackpot.buyTickets` (≤10 tickets) requires the caller to
+  supply specific `{normals, bonusball}` picks - the starter kit generates
+  those **client-side** in JS (`lib/tickets.ts`'s `randomTicket()`), not
+  on-chain. The `IJackpotRandomTicketBuyer` interface and its address
+  (`0xb9560b43...`) that were previously in this contract, "confirmed
+  against llms.megapot.io/tasks/buy-random," don't correspond to anything
+  real - there's no `buy-random` task in Megapot's actual task catalog
+  either. **Fixed**: every purchase, any size, now routes through
+  `BatchPurchaseFacilitator.createBatchOrder`'s `_dynamicTicketCount`,
+  which the real contract fills with its own generated ticket numbers
+  (confirmed via the same kit's `useBulkPurchase.ts`, which explicitly notes
+  this in a comment) - Push never generates or accepts ticket numbers
+  itself. Two more assumed-real functions turned out not to exist either:
+  `hasActiveBatchOrder()` and `minimumTicketCount()`. The real one-order-
+  per-recipient check the starter kit's own UI does is
+  `getBatchOrderInfo(recipient).batchOrder.remainingTickets > 0` - that's
+  what Push checks now instead.
 
 Still open, not verified against a live network:
 
-- `TICKET_PRICE` is hardcoded at $1 - should read live from Megapot's
-  `getDrawingState()` instead before deploying.
 - Yield distribution to bankroll backers is not implemented -
   `fundBankroll()` accepts deposits but doesn't track or pay out shares yet.
 
@@ -160,7 +189,14 @@ playing, and everyone watches the same periodic draw resolve together.
 `requestCommunityDraw()` called periodically (e.g. once a day, permissionless,
 could be automated with a keeper).
 
-## Megapot contract addresses (confirmed from llms.megapot.io, not guessed)
+## Megapot contract addresses
+
+Confirmed two ways: originally against llms.megapot.io, and re-confirmed in
+this pass by cross-checking against `megapot-starter-kit`'s own
+`src/config/contracts.ts` (cloned directly, not just its docs) - Jackpot,
+USDC, and BatchPurchaseFacilitator all match exactly on both mainnet and
+testnet. There is no `JackpotRandomTicketBuyer` address because that
+contract doesn't exist - see "What's verified vs. still open" above.
 
 Base mainnet (chain ID 8453):
 
@@ -168,7 +204,6 @@ Base mainnet (chain ID 8453):
 |---|---|
 | Jackpot | `0x3bAe643002069dBCbcd62B1A4eb4C4A397d042a2` |
 | USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
-| JackpotRandomTicketBuyer | `0xb9560b43b91dE2c1DaF5dfbb76b2CFcDaFc13aBd` |
 | BatchPurchaseFacilitator | `0xBA343479D98a1Ed333899999D95a7343B808a76F` |
 
 Base Sepolia testnet (chain ID 84532) - use these for development:
@@ -177,34 +212,35 @@ Base Sepolia testnet (chain ID 84532) - use these for development:
 |---|---|
 | Jackpot | `0x465dA3c859f193A3807386387bEE941B2A4c3279` |
 | USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
-| JackpotRandomTicketBuyer | `0x53c04e7e5044B28Ea8A4F9c4b26E3Ac1aeb63746` |
 | BatchPurchaseFacilitator | `0x62A5D60F486D01a28071652a7951Aff1EA4c5b7c` |
 
 ## Important correction: large payouts are NOT instant
 
-An earlier version of this contract assumed every ticket purchase completes
-synchronously in the same transaction. That's only true up to 10 tickets
-(`JackpotRandomTicketBuyer`, immediate). **Above 10, Megapot requires routing
-through `BatchPurchaseFacilitator.createBatchOrder`, which is keeper-executed
-- not immediate.** The order is created in one transaction, then an
+An earlier version of this contract assumed small purchases (≤10 tickets)
+complete synchronously in the same transaction, via a separate "random
+ticket buyer" contract. That contract doesn't exist (see "What's verified
+vs. still open" above) - **every purchase, any size, now routes through
+`BatchPurchaseFacilitator.createBatchOrder`, which is keeper-executed, not
+immediate.** The order is created in one transaction, then an
 off-chain keeper fills it over one or more subsequent transactions; the
 frontend has to poll `getBatchOrderInfo(recipient)` until `remainingTickets`
 reaches 0.
 
-This matters a lot for Push specifically, since most meaningful wins (any
-stake above a couple dollars at tier 5+) land well above 10 tickets. The
-`_buyTickets()` helper in the contract now branches automatically: <=10 goes
-through the immediate path, >10 creates a batch order and emits
-`BatchOrderPending` so the frontend knows to switch into a polling state
-("buying your tickets...") instead of assuming instant delivery.
+This matters for every win, not just large ones - the frontend should always
+expect "buying your tickets..." polling after a cash-out, never instant
+delivery. `_buyTickets()` emits `BatchOrderPending` on every purchase so the
+frontend has a consistent signal to switch into that polling state.
 
 **One more real constraint worth designing the UI around:** Megapot only
-allows **one active batch order per recipient at a time**
-(`ActiveBatchOrderExists()` reverts otherwise). If a player wins big twice in
-quick succession before the first batch finishes executing, the second
-`settleCashOut` will revert. Worth deciding: block a player from starting a
-new round while they have tickets pending, or catch and surface this
-specific revert with a clear "your last big win is still being processed"
+allows **one active batch order per recipient at a time** (the starter kit's
+own `Play.tsx` derives this as `getBatchOrderInfo(recipient).batchOrder
+.remainingTickets > 0` - there's no confirmed dedicated boolean getter or
+custom error name for it, so don't assume one in a frontend either). Push
+checks this the same way before calling `createBatchOrder` and reverts with
+a plain string reason if a player wins big twice in quick succession before
+the first batch finishes executing. Worth deciding: block a player from
+starting a new round while they have tickets pending, or catch and surface
+this specific revert with a clear "your last win is still being processed"
 message rather than a generic error.
 
 ## Tier design
@@ -224,7 +260,10 @@ whether the bankroll is profitable over volume.
 2. ~~Add `inco.getFee()` payment handling if required.~~ Done -
    `stake()`/`requestCashOut()` self-fund the ETH fee reserve, plus a
    `receive()` manual backstop.
-3. Replace hardcoded `TICKET_PRICE` with a live `getDrawingState()` read.
+3. ~~Replace hardcoded `TICKET_PRICE` with a live `getDrawingState()`
+   read.~~ Done - also surfaced and fixed a bigger problem along the way:
+   `JackpotRandomTicketBuyer` doesn't exist (see "What's verified vs. still
+   open"). Every purchase now routes through `BatchPurchaseFacilitator`.
 4. Design and implement bankroll backer shares/yield.
 5. ~~Write Foundry tests against Inco's `IncoTest` base contract before
    touching testnet.~~ Done - see "Test suite" below.
@@ -297,14 +336,14 @@ concern for a value that scales with player stake. Fixed with an explicit
 coverage - see "Next steps" above for the `IncoTest` base-contract pattern
 to write them against.
 
-## Test suite - 10/10 passing, against the real Inco harness
+## Test suite - 11/11 passing, against the real Inco harness
 
 `foundry/test/Push.t.sol` tests Push against Inco's own real `IncoTest` base
 contract (full fake infra: Safe multisig deploy, TEE bootstrap simulation,
 real `IncoLightning` contract deployed in test mode) and realistic mocks of
-Megapot's two ticket-purchase contracts (`foundry/test/mocks/Mocks.sol`) that
-enforce the same constraints as the real ones (10-ticket cap on the random
-buyer, one-active-order-per-recipient on the batch facilitator).
+Megapot's Jackpot (live ticket price) and BatchPurchaseFacilitator
+(`foundry/test/mocks/Mocks.sol`) that enforce the same
+one-active-order-per-recipient constraint as the real one.
 
 ```
 cd foundry
@@ -315,10 +354,11 @@ Covers: solvency rejection when the bankroll can't cover worst case,
 rejection when the caller doesn't top up Push's Inco ETH fee reserve,
 correct reserve/release accounting on both survive and crash outcomes,
 player stats and streak tracking, double-settlement protection, cashout
-access control, correct routing to the batch facilitator above 10 tickets,
-and the community
-pool paying out exactly what it accumulated - including the small-pot case
-that correctly buys zero tickets rather than reverting or over-promising.
+access control, routing every purchase through the batch facilitator,
+rejecting a settlement while the same recipient has a pending order, and the
+community pool paying out exactly what it accumulated - including the
+small-pot case that correctly buys zero tickets rather than reverting or
+over-promising.
 
 ### Two real findings from writing these tests (not just "tests added")
 

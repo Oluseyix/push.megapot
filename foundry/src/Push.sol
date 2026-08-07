@@ -7,28 +7,38 @@ pragma solidity ^0.8.20;
 import {e, ebool, euint256, inco} from "@inco/lightning/src/Lib.sol";
 import {DecryptionAttestation} from "@inco/lightning/src/lightning-parts/DecryptionAttester.types.sol";
 
-interface IJackpotRandomTicketBuyer {
-    // count capped at 1-10 by the real contract - InvalidTicketCount() otherwise.
-    // Confirmed against llms.megapot.io/tasks/buy-random.
-    function buyTickets(
-        uint256 _count,
-        address _recipient,
-        address[] calldata _referrers,
-        uint256[] calldata _referralSplitBps, // misleadingly named on Megapot's side - actually 1e18 PRECISE_UNIT scale, not bps
-        bytes32 _source
-    ) external returns (uint256[] memory ticketIds);
-}
-
 struct StaticTicket {
     uint8[] normals;
     uint8 bonusball;
 }
 
+/// @dev There is no on-chain "buy N random tickets" call on the real
+/// protocol (no such thing as a separate "JackpotRandomTicketBuyer"
+/// contract - that was an earlier, unverified assumption in this codebase).
+/// Every real purchase path needs either specific number picks
+/// (Jackpot.buyTickets, confirmed via megapot-starter-kit's useBuyTickets.ts)
+/// or a dynamic count filled with facilitator-generated numbers via
+/// BatchPurchaseFacilitator.createBatchOrder (confirmed via the same kit's
+/// useBulkPurchase.ts, which explicitly notes the facilitator "generates its
+/// own values per fill" for the dynamic portion - unlike Jackpot.buyTickets,
+/// this genuinely has no ticket-count minimum in the real ABI). Push routes
+/// every purchase through the facilitator so it never needs to generate or
+/// accept specific ticket numbers itself.
+struct BatchOrderInfo {
+    uint256 orderDrawingId;
+    uint64 remainingUSDC;
+    uint64 remainingTickets;
+    uint64 totalTicketsOrdered;
+    uint64 dynamicTicketCount;
+    address[] referrers;
+    uint256[] referralSplit;
+}
+
 interface IBatchPurchaseFacilitator {
-    // NOT immediate - keeper-executed. Only usable for counts >= minimumTicketCount()
-    // (currently 10). A recipient can only have ONE active order at a time -
-    // reverts with ActiveBatchOrderExists() otherwise. Confirmed against
-    // llms.megapot.io/tasks/buy-bulk.
+    // Confirmed against megapot-starter-kit's useBulkPurchase.ts ABI
+    // (github.com/coordinationlabs/megapot-starter-kit) - the actual
+    // frontend kit this repo's task instructions point to as the wagmi/viem
+    // base, not docs or memory.
     function createBatchOrder(
         address _recipient,
         uint64 _dynamicTicketCount,
@@ -38,8 +48,43 @@ interface IBatchPurchaseFacilitator {
         bytes32 _source
     ) external;
 
-    function hasActiveBatchOrder(address _recipient) external view returns (bool);
-    function minimumTicketCount() external view returns (uint256);
+    // There is no separate hasActiveBatchOrder() boolean getter on the real
+    // contract - the starter kit's own UI derives "has an order in flight"
+    // as `getBatchOrderInfo(recipient).batchOrder.remainingTickets > 0`
+    // (src/pages/Play.tsx's `hasInFlightOrder`), which is what Push mirrors
+    // below instead of assuming a getter that doesn't exist.
+    function getBatchOrderInfo(address _recipient)
+        external
+        view
+        returns (BatchOrderInfo memory batchOrder, StaticTicket[] memory staticTickets);
+}
+
+/// @dev Confirmed against megapot-starter-kit's useJackpotState.ts -
+/// `Jackpot.getDrawingState(uint256)` is keyed by drawing id, not
+/// parameterless, and `Jackpot.currentDrawingId()` gives the id to pass.
+/// Only the fields Push actually reads are declared here; the real struct
+/// has more (prizePool, edgePerTicket, etc.) but Solidity ABI-decodes a
+/// tuple positionally, so every field up to the last one used must be
+/// present and in order.
+struct DrawingState {
+    uint256 prizePool;
+    uint256 ticketPrice;
+    uint256 edgePerTicket;
+    uint256 referralWinShare;
+    uint256 referralFee;
+    uint256 globalTicketsBought;
+    uint256 lpEarnings;
+    uint256 drawingTime;
+    uint256 winningTicket;
+    uint8 ballMax;
+    uint8 bonusballMax;
+    address payoutCalculator;
+    bool jackpotLock;
+}
+
+interface IJackpot {
+    function currentDrawingId() external view returns (uint256);
+    function getDrawingState(uint256 _drawingId) external view returns (DrawingState memory);
 }
 
 interface IERC20 {
@@ -63,11 +108,10 @@ interface IERC20 {
 contract Push {
     using e for uint256;
 
-    uint256 public constant TICKET_PRICE = 1_000_000; // $1 USDC, 6 decimals
     uint256 public constant COMMUNITY_SKIM_BPS = 200; // 2% of every stake feeds the community pool
     uint256[] public tiers; // e.g. [1,2,3,5,8,12,20]
 
-    IJackpotRandomTicketBuyer public immutable ticketBuyer;
+    IJackpot public immutable jackpot;
     IBatchPurchaseFacilitator public immutable batchFacilitator;
     IERC20 public immutable usdc;
     address public immutable referrer;
@@ -81,6 +125,14 @@ contract Push {
         uint256 reserved;
         euint256 crashTierIndex; // sealed - never allowed to the player
         bool settled;
+        // Locked in at stake time, not re-read at settle time: `reserved`
+        // above was computed from this same price, so re-reading a possibly
+        // different live price at settle would risk `reserved - cost`
+        // underflowing (and reverting a legitimate win) if the live price
+        // rose between stake and settle. Settling against the price this
+        // round actually reserved against keeps solvency guaranteed by
+        // construction, same principle as the worst-case reservation itself.
+        uint256 ticketPriceAtStake;
     }
 
     mapping(uint256 => Round) public rounds;
@@ -136,14 +188,14 @@ contract Push {
     event CommunityDrawSettled(uint256 indexed periodId, address indexed winner, uint256 ticketsWon);
 
     constructor(
-        address _ticketBuyer,
+        address _jackpot,
         address _batchFacilitator,
         address _usdc,
         address _referrer,
         uint256[] memory _tiers
     ) {
         require(_tiers.length > 0, "need at least one tier");
-        ticketBuyer = IJackpotRandomTicketBuyer(_ticketBuyer);
+        jackpot = IJackpot(_jackpot);
         batchFacilitator = IBatchPurchaseFacilitator(_batchFacilitator);
         usdc = IERC20(_usdc);
         referrer = _referrer;
@@ -151,32 +203,41 @@ contract Push {
         tiers = _tiers;
     }
 
-    /// @notice Routes a ticket purchase through the right Megapot contract
-    /// based on size. <=10: JackpotRandomTicketBuyer, immediate, tickets
-    /// land in `recipient`'s wallet in this same transaction. >10: must go
-    /// through BatchPurchaseFacilitator instead - NOT immediate, keeper-
-    /// executed, and Megapot only allows one active batch order per
-    /// recipient at a time (ActiveBatchOrderExists() reverts otherwise).
-    /// Emits BatchOrderPending so a frontend/keeper knows to poll
-    /// getBatchOrderInfo(recipient) rather than expect tickets right away.
-    function _buyTickets(uint256 count, address recipient) internal {
+    /// @notice Live $-per-ticket price read from Megapot's own current
+    /// drawing, instead of assuming it's permanently $1. Read once per
+    /// transaction and reused throughout that transaction (see stake(),
+    /// settleCashOut(), settleCommunityDraw()) so a single call's USDC
+    /// pulled, worst-case reserved, and tickets bought all agree with each
+    /// other, even if the live price could in principle differ between two
+    /// separate transactions.
+    function ticketPrice() public view returns (uint256) {
+        return jackpot.getDrawingState(jackpot.currentDrawingId()).ticketPrice;
+    }
+
+    /// @notice Routes every ticket purchase through
+    /// BatchPurchaseFacilitator.createBatchOrder, letting the facilitator
+    /// generate the actual ticket numbers itself via `_dynamicTicketCount`
+    /// (confirmed real behavior, not just for large orders - see the struct
+    /// comment above). This is NOT immediate - keeper-executed, so tickets
+    /// don't land in `recipient`'s wallet in this transaction; the frontend
+    /// polls getBatchOrderInfo(recipient) instead. Megapot only allows one
+    /// active order per recipient at a time, checked here via
+    /// remainingTickets rather than assuming a dedicated boolean getter.
+    function _buyTickets(uint256 count, address recipient, uint256 priceNow) internal {
+        (BatchOrderInfo memory existing,) = batchFacilitator.getBatchOrderInfo(recipient);
+        require(existing.remainingTickets == 0, "recipient already has tickets pending from a previous win");
+        require(count <= type(uint64).max, "ticket count exceeds uint64 range");
+
         address[] memory refs = new address[](1);
         refs[0] = referrer;
         uint256[] memory splits = new uint256[](1);
         splits[0] = 1e18;
 
-        if (count <= 10) {
-            usdc.approve(address(ticketBuyer), count * TICKET_PRICE);
-            ticketBuyer.buyTickets(count, recipient, refs, splits, bytes32(0));
-        } else {
-            require(!batchFacilitator.hasActiveBatchOrder(recipient), "recipient already has a pending batch order");
-            require(count <= type(uint64).max, "ticket count exceeds uint64 range");
-            usdc.approve(address(batchFacilitator), count * TICKET_PRICE);
-            StaticTicket[] memory none = new StaticTicket[](0);
-            // forge-lint: disable-next-line(unsafe-typecast)
-            batchFacilitator.createBatchOrder(recipient, uint64(count), none, refs, splits, bytes32(0));
-            emit BatchOrderPending(recipient, count);
-        }
+        usdc.approve(address(batchFacilitator), count * priceNow);
+        StaticTicket[] memory none = new StaticTicket[](0);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        batchFacilitator.createBatchOrder(recipient, uint64(count), none, refs, splits, bytes32(0));
+        emit BatchOrderPending(recipient, count);
     }
 
     // ============================================================
@@ -205,14 +266,15 @@ contract Push {
     function stake(uint256 dollarAmount) external payable returns (uint256 roundId) {
         require(dollarAmount > 0, "stake at least $1");
         require(msg.value >= inco.getFee(), "send enough ETH to cover the Inco confidential-op fee");
-        uint256 totalCost = dollarAmount * TICKET_PRICE;
+        uint256 priceNow = ticketPrice();
+        uint256 totalCost = dollarAmount * priceNow;
         require(usdc.transferFrom(msg.sender, address(this), totalCost), "usdc transfer failed");
 
         uint256 skim = (totalCost * COMMUNITY_SKIM_BPS) / 10_000;
         communityPotBalance += skim;
         bankroll += (totalCost - skim);
 
-        uint256 worstCase = dollarAmount * tiers[tiers.length - 1] * TICKET_PRICE;
+        uint256 worstCase = dollarAmount * tiers[tiers.length - 1] * priceNow;
         require(bankroll >= worstCase, "bankroll can't cover this stake right now - try a smaller amount");
         bankroll -= worstCase;
 
@@ -225,7 +287,8 @@ contract Push {
             stakedDollars: dollarAmount,
             reserved: worstCase,
             crashTierIndex: crashTierIndex,
-            settled: false
+            settled: false,
+            ticketPriceAtStake: priceNow
         });
 
         CommunityPeriod storage p = periods[currentPeriodId];
@@ -275,10 +338,13 @@ contract Push {
         if (survived) {
             uint8 claimedTierIndex = pendingClaimedTier[roundId];
             uint256 tierValue = tiers[claimedTierIndex];
+            // Settle against the price this round reserved against at stake
+            // time (r.ticketPriceAtStake), not a fresh live read - see the
+            // Round struct's field comment for why.
             ticketsWon = r.stakedDollars * tierValue;
-            uint256 cost = ticketsWon * TICKET_PRICE;
+            uint256 cost = ticketsWon * r.ticketPriceAtStake;
             bankroll += (r.reserved - cost);
-            _buyTickets(ticketsWon, r.player);
+            _buyTickets(ticketsWon, r.player, r.ticketPriceAtStake);
 
             stats.currentStreak += 1;
             stats.totalCashouts += 1;
@@ -323,7 +389,7 @@ contract Push {
 
     // ============================================================
     // Community pool - non-leveraged, always solvent by construction.
-    // Payout always equals exactly potAtSnapshot / TICKET_PRICE tickets,
+    // Payout always equals exactly potAtSnapshot / ticketPrice() tickets,
     // never a multiplier of it, so unlike the climb itself, this can never
     // run short of funds.
     // ============================================================
@@ -357,8 +423,11 @@ contract Push {
     /// weight fetched off-chain after requestCommunityDraw(). Walks the
     /// period's participant list to find whose cumulative weight range
     /// contains the winning value, then buys them exactly
-    /// potAtSnapshot / TICKET_PRICE real tickets - never more than what was
-    /// actually accumulated.
+    /// potAtSnapshot / ticketPrice() real tickets (live price read at
+    /// settle time - no reservation to protect against price drift here,
+    /// unlike the core climb, since this only ever spends a fixed,
+    /// already-accumulated USDC pot rather than subtracting from one) -
+    /// never more than what was actually accumulated.
     function settleCommunityDraw(
         uint256 periodId,
         DecryptionAttestation memory attestation,
@@ -389,9 +458,10 @@ contract Push {
         }
         require(winner != address(0), "winner resolution failed");
 
-        uint256 ticketsWon = p.potAtSnapshot / TICKET_PRICE;
+        uint256 priceNow = ticketPrice();
+        uint256 ticketsWon = p.potAtSnapshot / priceNow;
         if (ticketsWon > 0) {
-            _buyTickets(ticketsWon, winner);
+            _buyTickets(ticketsWon, winner, priceNow);
         }
 
         emit Achievement(winner, "community_draw_won", ticketsWon);
