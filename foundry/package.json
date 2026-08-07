@@ -1,0 +1,11 @@
+{
+  "name": "push-game",
+  "private": true,
+  "devDependencies": {
+    "@inco/lightning": "1.0.2",
+    "@openzeppelin/contracts": "^5.0.0",
+    "@openzeppelin/contracts-upgradeable": "^5.0.0",
+    "@safe-global/safe-smart-account": "https://github.com/safe-global/safe-smart-account.git#dc437e8",
+    "solc": "0.8.35"
+  }
+}
