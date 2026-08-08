@@ -73,3 +73,13 @@ export const PUSH_DEPLOYED = PUSH_ADDRESS !== ZERO_ADDRESS;
  * (excess is never refunded, just stays in the reserve).
  */
 export const INCO_FEE_TOPUP_WEI = 2_000_000_000_000n; // 2 * 0.000001 ether
+
+/**
+ * Fallback tier ladder for paper/demo play (src/lib/paperGame.ts,
+ * PaperPlay.tsx) when Push isn't deployed yet and there's nothing on-chain
+ * to read via `usePushTiers`. Matches the ladder used in
+ * foundry/test/Push.t.sol and foundry/script/DeployPush.s.sol - keep in
+ * sync if either changes. Once deployed, paper mode prefers the real
+ * on-chain tiers and only falls back to this.
+ */
+export const DEFAULT_TIERS = [1, 2, 3, 5, 8, 12, 20];
