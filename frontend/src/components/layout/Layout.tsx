@@ -20,6 +20,7 @@ import { Footer } from './Footer';
 import { MobileWalletBar } from './MobileWalletBar';
 import { MobileBottomNav, Nav, type NavKey } from './Nav';
 import { ProfileCard } from './ProfileCard';
+import { TickerBar } from './TickerBar';
 
 export function Layout({
   active,
@@ -32,6 +33,7 @@ export function Layout({
 }) {
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      <TickerBar />
       <header className="sticky top-0 z-30 border-b border-zinc-200 bg-white/90 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/90">
         <div className="flex items-center justify-between gap-3 px-4 py-3">
           <a

@@ -22,14 +22,14 @@
  */
 import type { ReactNode } from 'react';
 import { ClimbIcon } from '@/components/icons/ClimbIcon';
-import { HomeIcon } from '@/components/icons/HomeIcon';
 import { LeaderboardIcon } from '@/components/icons/LeaderboardIcon';
 
-export type NavKey = 'home' | 'play' | 'leaderboard';
+// Just two tabs: the game itself (stake, climb, cash out - all one screen,
+// no separate "Play" page to navigate to) and the leaderboard.
+export type NavKey = 'home' | 'leaderboard';
 
 const ITEMS: { key: NavKey; label: string; icon: ReactNode }[] = [
-  { key: 'home', label: 'Home', icon: <HomeIcon /> },
-  { key: 'play', label: 'Play', icon: <ClimbIcon /> },
+  { key: 'home', label: 'Push', icon: <ClimbIcon /> },
   { key: 'leaderboard', label: 'Leaderboard', icon: <LeaderboardIcon /> },
 ];
 

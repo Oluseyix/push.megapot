@@ -11,19 +11,36 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 
-const STORAGE_KEY = 'push-paper-wallet-v1';
+const STORAGE_KEY = 'push-paper-wallet-v2';
 const STARTING_BALANCE = 1000;
+const MAX_RECENT_RESULTS = 12;
 
-type PaperState = { balance: number; totalTicketsWon: number; totalCashouts: number; totalCrashes: number };
+export type PaperResult = { multiplier: number; survived: boolean };
+
+type PaperState = {
+  balance: number;
+  totalTicketsWon: number;
+  totalCashouts: number;
+  totalCrashes: number;
+  recentResults: PaperResult[];
+};
+
+const FRESH: PaperState = {
+  balance: STARTING_BALANCE,
+  totalTicketsWon: 0,
+  totalCashouts: 0,
+  totalCrashes: 0,
+  recentResults: [],
+};
 
 function load(): PaperState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw) as PaperState;
+    if (raw) return { ...FRESH, ...(JSON.parse(raw) as Partial<PaperState>) };
   } catch {
     // localStorage unavailable or corrupt - fall through to a fresh wallet.
   }
-  return { balance: STARTING_BALANCE, totalTicketsWon: 0, totalCashouts: 0, totalCrashes: 0 };
+  return { ...FRESH };
 }
 
 function save(state: PaperState) {
@@ -43,21 +60,25 @@ export function usePaperWallet() {
     setState((prev) => ({ ...prev, balance: prev.balance - amount }));
   }, []);
 
-  const recordCashOut = useCallback((ticketsWon: number) => {
+  const recordCashOut = useCallback((ticketsWon: number, multiplier: number) => {
     setState((prev) => ({
       ...prev,
       totalTicketsWon: prev.totalTicketsWon + ticketsWon,
       totalCashouts: prev.totalCashouts + 1,
+      recentResults: [{ multiplier, survived: true }, ...prev.recentResults].slice(0, MAX_RECENT_RESULTS),
     }));
   }, []);
 
-  const recordCrash = useCallback(() => {
-    setState((prev) => ({ ...prev, totalCrashes: prev.totalCrashes + 1 }));
+  const recordCrash = useCallback((multiplier: number) => {
+    setState((prev) => ({
+      ...prev,
+      totalCrashes: prev.totalCrashes + 1,
+      recentResults: [{ multiplier, survived: false }, ...prev.recentResults].slice(0, MAX_RECENT_RESULTS),
+    }));
   }, []);
 
   const reset = useCallback(() => {
-    const fresh = { balance: STARTING_BALANCE, totalTicketsWon: 0, totalCashouts: 0, totalCrashes: 0 };
-    setState(fresh);
+    setState({ ...FRESH });
   }, []);
 
   return { ...state, stake, recordCashOut, recordCrash, reset };
